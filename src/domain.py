@@ -10,6 +10,10 @@ class DomainError(Exception):
 class ValidationError(DomainError):
     """Input does not satisfy a domain rule."""
 
+    def __init__(self, message, issues=None):
+        super().__init__(message)
+        self.issues = issues or []
+
 
 class PermissionDenied(DomainError):
     """Actor is not allowed to perform the action."""

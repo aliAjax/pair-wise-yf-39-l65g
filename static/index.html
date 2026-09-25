@@ -6,28 +6,164 @@
   <title>野生动物疫病监测与离线同步</title>
   <style>
     body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; margin: 2rem; color: #1f2937; }
-    main { max-width: 820px; margin: auto; }
+    main { max-width: 920px; margin: auto; }
     pre { background: #f3f4f6; padding: 1rem; border-radius: 8px; overflow-x: auto; }
     button { padding: .5rem .8rem; cursor: pointer; }
+    section { border: 1px solid #e5e7eb; border-radius: 8px; padding: 1rem 1.25rem; margin: 1.25rem 0; }
+    label { display: inline-block; margin-right: .75rem; }
+    input, select { padding: .35rem .5rem; margin: .25rem .25rem .25rem 0; }
+    table { border-collapse: collapse; width: 100%; margin-top: .75rem; font-size: .9rem; }
+    th, td { border: 1px solid #e5e7eb; padding: .4rem .6rem; text-align: left; vertical-align: top; }
+    .invalid { color: #b91c1c; }
+    .valid { color: #047857; font-weight: 600; }
+    .muted { color: #6b7280; }
   </style>
 </head>
 <body>
 <main>
   <h1>野生动物疫病监测与离线同步</h1>
-  <p>这是最小演示页面。使用浏览器或 curl 调用 JSON API。</p>
   <p><button onclick="checkHealth()">检查服务状态</button></p>
+
+  <section>
+    <h2>聚集事件核实</h2>
+    <p class="muted">
+      核实标准：同一区域、采样时间跨度不超过 14 天、记录两两相距不超过 10 公里，
+      且至少有 3 份已提交（submitted）记录。已归入其他确认事件或缺坐标的记录会逐条列出问题。
+      确认后事件编号写回相关记录；重复确认沿用第一次结果。
+    </p>
+    <p>
+      <label>操作身份
+        <select id="role">
+          <option value="epidemiologist">epidemiologist（流行病学家）</option>
+          <option value="admin">admin</option>
+          <option value="field">field</option>
+          <option value="viewer">viewer</option>
+        </select>
+      </label>
+      <label>用户ID <input id="user" value="duty-officer" size="12"></label>
+    </p>
+    <p>
+      <label>聚集事件编号 <input id="clusterId" placeholder="例如 uuid" size="36"></label>
+      <button onclick="loadClusters()">列出事件</button>
+    </p>
+    <table id="clusterTable" hidden>
+      <thead><tr><th>事件编号</th><th>区域</th><th>状态</th><th>已关联记录</th></tr></thead>
+      <tbody></tbody>
+    </table>
+    <p>
+      <label>候选观察记录编号（逗号分隔，留空用事件已存列表）<br>
+        <input id="observationIds" size="90" placeholder="id1,id2,id3">
+      </label>
+    </p>
+    <p>
+      <button onclick="previewCluster()">先核实（不落库）</button>
+      <button onclick="confirmCluster()">发起确认</button>
+      <button onclick="showMembers()">查看关联情况</button>
+    </p>
+    <div id="preview"></div>
+  </section>
+
   <pre id="result">等待操作</pre>
+
   <h2>常用接口</h2>
   <pre>GET  /health
 GET  /api/&lt;kind&gt;
 POST /api/&lt;kind&gt;
 GET  /api/entities/&lt;id&gt;
-POST /api/entities/&lt;id&gt;/actions</pre>
+POST /api/entities/&lt;id&gt;/actions
+GET  /api/clusters/&lt;id&gt;/preview?observation_ids=a,b,c
+GET  /api/clusters/&lt;id&gt;/members</pre>
 </main>
 <script>
+function headers(json) {
+  const base = {'X-User-Id': document.getElementById('user').value || 'anonymous',
+                'X-Role': document.getElementById('role').value};
+  if (json) base['Content-Type'] = 'application/json';
+  return base;
+}
+function show(payload) {
+  document.getElementById('result').textContent = JSON.stringify(payload, null, 2);
+}
 async function checkHealth() {
-  const response = await fetch('/health');
-  document.getElementById('result').textContent = JSON.stringify(await response.json(), null, 2);
+  show(await (await fetch('/health')).json());
+}
+function cid() {
+  const value = document.getElementById('clusterId').value.trim();
+  if (!value) { show({error: '请先填写聚集事件编号'}); return null; }
+  return value;
+}
+function idsParam() {
+  return document.getElementById('observationIds').value.trim()
+    .split(',').map(s => s.trim()).filter(Boolean);
+}
+async function loadClusters() {
+  const data = await (await fetch('/api/clusters')).json();
+  const table = document.getElementById('clusterTable');
+  const body = table.querySelector('tbody');
+  body.innerHTML = '';
+  (data.items || []).forEach(c => {
+    const tr = document.createElement('tr');
+    const linked = (c.data && c.data.observation_ids || []).length;
+    tr.innerHTML = `<td><a href="#" onclick="document.getElementById('clusterId').value='${c.id}';return false">${c.id}</a></td>
+      <td>${c.data.region ?? ''}</td><td>${c.status}</td><td>${linked}</td>`;
+    body.appendChild(tr);
+  });
+  table.hidden = !(data.items || []).length;
+  show(data);
+}
+function renderPreview(data) {
+  const box = document.getElementById('preview');
+  if (data.valid) {
+    box.innerHTML = `<p class="valid">核实通过：${data.members.length} 份记录满足聚集条件，可确认。</p>`;
+  } else {
+    const rows = (data.issues || []).map(i =>
+      `<tr><td>${i.id ?? '（整体）'}</td><td class="invalid">${i.reason}</td></tr>`).join('');
+    box.innerHTML = `<p class="invalid">核实未通过，共 ${data.issues.length} 个问题，合格记录 ${data.members.length} 份（原数据未改动）：</p>
+      <table><thead><tr><th>记录编号</th><th>问题</th></tr></thead><tbody>${rows}</tbody></table>`;
+  }
+}
+async function previewCluster() {
+  const id = cid(); if (!id) return;
+  const ids = idsParam();
+  const url = '/api/clusters/' + encodeURIComponent(id) + '/preview'
+    + (ids.length ? '?observation_ids=' + encodeURIComponent(ids.join(',')) : '');
+  const response = await fetch(url, {headers: headers()});
+  const data = await response.json();
+  renderPreview(data);
+  show(data);
+}
+async function confirmCluster() {
+  const id = cid(); if (!id) return;
+  const payload = {action: 'confirm_cluster', data: {observation_ids: idsParam()}};
+  if (!payload.data.observation_ids.length) delete payload.data.observation_ids;
+  const response = await fetch('/api/entities/' + encodeURIComponent(id) + '/actions', {
+    method: 'POST', headers: headers(true), body: JSON.stringify(payload),
+  });
+  const data = await response.json();
+  if (response.ok) {
+    document.getElementById('preview').innerHTML =
+      `<p class="valid">事件 ${data.id} 已确认，事件编号已写回 ${(data.data.observation_ids||[]).length} 份记录。</p>`;
+  } else if (data.issues) {
+    renderPreview({valid: false, issues: data.issues, members: []});
+  }
+  show(data);
+}
+async function showMembers() {
+  const id = cid(); if (!id) return;
+  const data = await (await fetch('/api/clusters/' + encodeURIComponent(id) + '/members',
+    {headers: headers()})).json();
+  if (data.cluster) {
+    const rows = (data.linked_observations || []).map(o =>
+      `<tr><td>${o.id}</td><td>${o.status}</td><td>${o.data.event_id ?? ''}</td>
+       <td>${o.data.observed_at ?? ''}</td><td>${o.data.region ?? o.data.location ?? ''}</td>
+       <td>${o.data.lat ?? '—'}, ${o.data.lon ?? '—'}</td></tr>`).join('');
+    document.getElementById('preview').innerHTML =
+      `<p>事件 <strong>${data.cluster.id}</strong>（${data.cluster.status}，区域 ${data.cluster.data.region}）
+       关联记录 ${data.linked_observations.length} 份：</p>
+      <table><thead><tr><th>编号</th><th>状态</th><th>野外事件号</th><th>采样时间</th><th>区域</th><th>坐标</th></tr></thead>
+      <tbody>${rows}</tbody></table>`;
+  }
+  show(data);
 }
 </script>
 </body>

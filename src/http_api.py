@@ -71,7 +71,11 @@ def create_handler(service, rules, static_dir):
                 status = 400
             else:
                 status = 500
-            self._send(status, {"error": str(exc), "type": type(exc).__name__})
+            payload = {"error": str(exc), "type": type(exc).__name__}
+            issues = getattr(exc, "issues", None)
+            if issues:
+                payload["issues"] = issues
+            self._send(status, payload)
 
         def do_GET(self):
             try:
@@ -87,6 +91,13 @@ def create_handler(service, rules, static_dir):
                     return self._send(200, {"items": service.audit_log()})
                 if len(parts) == 3 and parts[:2] == ["api", "entities"]:
                     return self._send(200, service.get(parts[2]))
+                if len(parts) == 4 and parts[:2] == ["api", "clusters"] and parts[3] == "preview":
+                    query = parse_qs(parsed.query)
+                    raw_ids = query.get("observation_ids", [""])[0]
+                    observation_ids = [item.strip() for item in raw_ids.split(",") if item.strip()]
+                    return self._send(200, service.preview_cluster(parts[2], observation_ids or None))
+                if len(parts) == 4 and parts[:2] == ["api", "clusters"] and parts[3] == "members":
+                    return self._send(200, service.cluster_members(parts[2]))
                 if len(parts) >= 2 and parts[0] == "api":
                     if parts[1] == "entities":
                         raise NotFoundError("not found")
@@ -114,6 +125,11 @@ def create_handler(service, rules, static_dir):
                         raise ValidationError("action is required")
                     data = body.pop("data", body)
                     expected = body.pop("expected_version", None)
+                    if action == "confirm_cluster":
+                        return self._send(
+                            200,
+                            service.confirm_cluster(actor, parts[2], data, expected),
+                        )
                     return self._send(
                         200,
                         service.transition(actor, parts[2], action, data, expected),
@@ -123,13 +139,20 @@ def create_handler(service, rules, static_dir):
                     action = body.pop("action", None)
                     if not action:
                         raise ValidationError("action is required")
+                    action_data = body.pop("data", body)
+                    if action == "confirm_cluster":
+                        return self._send(
+                            200,
+                            service.confirm_cluster(actor, parts[2], action_data,
+                                                    body.pop("expected_version", None)),
+                        )
                     return self._send(
                         200,
                         service.transition(
                             actor,
                             parts[2],
                             action,
-                            body.pop("data", body),
+                            action_data,
                             body.pop("expected_version", None),
                         ),
                     )

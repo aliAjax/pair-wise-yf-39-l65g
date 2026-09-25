@@ -36,19 +36,121 @@ def _haversine_km(lat1, lon1, lat2, lon2):
     return 6371.0 * 2 * asin(sqrt(a))
 
 
+def _field(item, key):
+    """兼容扁平 dict（单元测试）与完整实体（坐标等在 data 下）。"""
+    data = item.get("data") if isinstance(item, dict) else None
+    if isinstance(data, dict) and key in data:
+        return data[key]
+    return item.get(key) if isinstance(item, dict) else None
+
+
+def _has_coords(observation):
+    return _field(observation, "lat") is not None and _field(observation, "lon") is not None
+
+
 def is_cluster(observations, max_days=14, radius_km=10):
+    """至少三份记录，且全部两两满足 14 天 / 10 公里才算聚集。"""
     if len(observations) < 3:
         return False
-    points = observations[:3]
-    same_window = all(
-        abs(_date_ordinal(points[0].get("observed_at")) - _date_ordinal(item.get("observed_at"))) <= max_days
-        for item in points[1:]
-    )
+    points = [item for item in observations if _has_coords(item)]
+    if len(points) != len(observations) or len(points) < 3:
+        return False
+    ordinals = [_date_ordinal(_field(item, "observed_at")) for item in points]
+    same_window = (max(ordinals) - min(ordinals)) <= max_days
     close = all(
-        _haversine_km(points[0]["lat"], points[0]["lon"], item["lat"], item["lon"]) <= radius_km
-        for item in points[1:]
+        _haversine_km(_field(points[i], "lat"), _field(points[i], "lon"),
+                      _field(points[j], "lat"), _field(points[j], "lon")) <= radius_km
+        for i in range(len(points))
+        for j in range(i + 1, len(points))
     )
     return same_window and close
+
+
+def evaluate_cluster(cluster, observations, confirmed_cluster_ids,
+                     min_records=3, max_days=14, radius_km=10):
+    """核实候选记录，返回 (member_ids, issues)。
+
+    member_ids：通过全部校验的记录编号；issues：[{"id", "reason"}]。
+    已归入其他已确认事件、缺坐标、非 submitted、跨区域或不满足
+    14 天 / 10 公里条件都会逐条指出问题与对应编号。
+    """
+    issues = []
+    members = []
+    cluster_data = cluster.get("data", cluster) if isinstance(cluster, dict) else {}
+    region = cluster_data.get("region")
+    cluster_id = str(cluster.get("id") or "")
+    for observation in observations:
+        oid = observation["id"]
+        data = observation.get("data", {})
+        if observation["status"] != "submitted":
+            issues.append({"id": oid, "reason": "status is %s, only submitted records count" % observation["status"]})
+            continue
+        linked = data.get("cluster_id")
+        if linked and str(linked) != cluster_id and str(linked) in confirmed_cluster_ids:
+            issues.append({"id": oid, "reason": "already linked to confirmed cluster %s" % linked})
+            continue
+        if not _has_coords(observation):
+            issues.append({"id": oid, "reason": "missing coordinates (lat/lon)"})
+            continue
+        obs_region = data.get("region", data.get("location"))
+        if obs_region != region:
+            issues.append({"id": oid, "reason": "region %r does not match cluster region %r" % (obs_region, region)})
+            continue
+        try:
+            _date_ordinal(data.get("observed_at"))
+        except (TypeError, ValueError):
+            issues.append({"id": oid, "reason": "invalid observed_at: %r" % data.get("observed_at")})
+            continue
+        members.append(observation)
+
+    if len(members) < min_records:
+        if not issues:
+            issues.append({
+                "id": None,
+                "reason": "cluster needs at least %d submitted records, found %d" % (min_records, len(members)),
+            })
+        return [], issues
+
+    if not is_cluster(members, max_days, radius_km):
+        flagged = set()
+        ordinals = {item["id"]: _date_ordinal(_field(item, "observed_at")) for item in members}
+        ids_by_ordinal = {}
+        for item in members:
+            ids_by_ordinal.setdefault(ordinals[item["id"]], item["id"])
+        ordered = sorted(ids_by_ordinal.items())
+        if ordered[-1][0] - ordered[0][0] > max_days:
+            # 端点与对侧最近一个点仍超过窗口，说明该端点本身脱离时间窗
+            earliest, latest = ordered[0][0], ordered[-1][0]
+            middle = [value for value, _ in ordered[1:-1]] or [
+                value for value in (earliest, latest)
+            ]
+            if latest - min(middle) > max_days:
+                oid = ordered[-1][1]
+                flagged.add(oid)
+                issues.append({"id": oid, "reason": "sampling time exceeds %d-day window" % max_days})
+            if max(middle) - earliest > max_days:
+                oid = ordered[0][1]
+                flagged.add(oid)
+                issues.append({"id": oid, "reason": "sampling time exceeds %d-day window" % max_days})
+        for i, left in enumerate(members):
+            for right in members[i + 1:]:
+                if right["id"] in flagged:
+                    continue
+                distance = _haversine_km(
+                    _field(left, "lat"), _field(left, "lon"),
+                    _field(right, "lat"), _field(right, "lon"),
+                )
+                if distance > radius_km:
+                    flagged.add(right["id"])
+                    issues.append({
+                        "id": right["id"],
+                        "reason": "distance %.1fkm from %s exceeds %skm" % (distance, left["id"], radius_km),
+                    })
+        if not issues:
+            issues.append({"id": None, "reason": "records do not form a cluster within %d days / %skm" % (max_days, radius_km)})
+        return [], issues
+
+    return [item["id"] for item in members], issues
 
 
 CUSTOM_CREATE = {'observation': _validate_observation, 'sample': _validate_sample}
@@ -63,6 +165,13 @@ class RuleEngine:
     ACTION_REQUIRED = {('observation', 'submit'): ('location', 'observed_at'), ('observation', 'reject'): ('reason',), ('observation', 'link_sample'): ('sample_id',), ('sample', 'send_lab'): ('lab_id',), ('sample', 'lab_result'): ('result', 'result_at'), ('sample', 'retest'): ('reason',), ('sample', 'close'): ('outcome',), ('cluster', 'confirm_cluster'): ('observation_ids', 'centroid'), ('cluster', 'dismiss'): ('reason',)}
     CREATE_ROLES = {'observation': ('admin', 'field'), 'sample': ('admin', 'field'), 'cluster': ('admin', 'epidemiologist')}
     ROLE_ACTIONS = {'submit': ('admin', 'field'), 'reject': ('admin', 'epidemiologist'), 'link_sample': ('admin', 'field'), 'send_lab': ('admin', 'field'), 'lab_result': ('admin', 'lab'), 'retest': ('admin', 'lab'), 'close': ('admin', 'epidemiologist'), 'confirm_cluster': ('admin', 'epidemiologist'), 'dismiss': ('admin', 'epidemiologist')}
+
+    def ensure_action_role(self, actor, kind, action):
+        kind = self.normalize_kind(kind)
+        allowed = self.ROLE_ACTIONS.get(
+            (kind, action), self.ROLE_ACTIONS.get(action, ("admin",))
+        )
+        self._ensure_role(actor, allowed)
 
     def normalize_kind(self, kind):
         return self.ALIASES.get(kind, kind)

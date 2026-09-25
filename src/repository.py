@@ -140,6 +140,55 @@ class SQLiteRepository:
             connection.close()
         return self.get_entity(entity_id)
 
+    def confirm_cluster_members(self, cluster_id, expected_version, member_ids, cluster_data):
+        """事务性确认：cluster -> confirmed（写入 cluster_data），成员观察记录写回 cluster_id。
+
+        任一环节失败整体回滚，保证“确认后写回”的原子性。
+        """
+        stamp = utcnow()
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT version, data FROM entities WHERE id = ?", (cluster_id,)
+            ).fetchone()
+            if not row:
+                raise NotFoundError("entity not found: " + cluster_id)
+            current_version = int(row["version"])
+            if expected_version is not None and current_version != int(expected_version):
+                raise ConflictError(
+                    "version conflict: expected %s, found %s"
+                    % (expected_version, current_version)
+                )
+            merged = dict(json.loads(row["data"]))
+            merged.update(cluster_data)
+            merged["observation_ids"] = list(member_ids)
+            connection.execute(
+                "UPDATE entities SET status = 'confirmed', version = version + 1, data = ?, updated_at = ? "
+                "WHERE id = ? AND version = ?",
+                (json.dumps(merged, ensure_ascii=False, sort_keys=True), stamp, cluster_id, current_version),
+            )
+            for observation_id in member_ids:
+                orow = connection.execute(
+                    "SELECT version, data FROM entities WHERE id = ?", (observation_id,)
+                ).fetchone()
+                if not orow:
+                    raise NotFoundError("entity not found: " + observation_id)
+                odata = json.loads(orow["data"])
+                odata["cluster_id"] = cluster_id
+                connection.execute(
+                    "UPDATE entities SET data = ?, version = version + 1, updated_at = ? "
+                    "WHERE id = ? AND version = ?",
+                    (json.dumps(odata, ensure_ascii=False, sort_keys=True), stamp, observation_id, int(orow["version"])),
+                )
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+        return self.get_entity(cluster_id)
+
     def append_audit(self, entity_id, actor_id, actor_role, action, from_status, to_status, detail):
         with self._connect() as connection:
             connection.execute(

@@ -34,6 +34,18 @@ python3 app.py --db ./data.db --port 8305
 - `GET /api/entities/<id>`：读取对象当前版本。
 - `POST /api/entities/<id>/actions`：提交`{"action":"动作名","data":{...},"expected_version":数字}`。
 - `GET /api/audit`：读取审计记录。
+- `POST /api/entities/<id>/actions`（`confirm_cluster`）：按规则核实并确认聚集事件，
+  通过后把事件编号写回每份关联观察记录（`data.cluster_id`）；失败时 400 响应带
+  `issues`，逐条给出问题记录编号与原因，原数据不变。事件已确认时重复提交沿用第一次结果。
+- `GET /api/clusters/<id>/preview?observation_ids=a,b,c`：只核实不落库，返回 `valid`、
+  `issues` 与合格成员；不传参数时用事件已存的 `observation_ids`。
+- `GET /api/clusters/<id>/members`：查看事件与观察记录的关联情况。
+
+聚集事件核实标准：同一区域（cluster 的 `region` 与观察记录的 `region`/`location`）、
+采样时间跨度不超过 14 天、记录两两相距不超过 10 公里（Haversine），且至少 3 份
+`submitted` 记录。已归入其他已确认事件、缺坐标、状态非 submitted、跨区域或不满足
+时空条件的记录都会逐条指出。确认操作在单个 SQLite 事务内完成（事件置 confirmed +
+成员写回 cluster_id）。
 
 请求身份通过`X-User-Id`和`X-Role`请求头传入。创建和动作的可执行角色由规则引擎控制。
 
