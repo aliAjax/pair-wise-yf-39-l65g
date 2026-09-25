@@ -33,9 +33,14 @@ python3 app.py --db ./data.db --port 8305
 - `POST /api/<kind>`：创建对象；请求体为JSON。
 - `GET /api/entities/<id>`：读取对象当前版本。
 - `POST /api/entities/<id>/actions`：提交`{"action":"动作名","data":{...},"expected_version":数字}`。
+- `GET /api/clusters/<id>/observations`：查看聚集事件及其关联的观察记录。
 - `GET /api/audit`：读取审计记录。
 
 请求身份通过`X-User-Id`和`X-Role`请求头传入。创建和动作的可执行角色由规则引擎控制。
+
+## 聚集事件确认规则
+
+对`cluster`执行`confirm_cluster`时逐一核实所勾选的观察记录：同一区域（`location`与事件`region`一致）、采样时间跨度不超过14天、两两相距不超过10公里，且至少三份`submitted`记录。已归入其他已确认事件或缺少坐标的记录会被拒绝，错误信息中指出问题和对应编号，校验失败时不改动任何数据。确认成功后事件编号（`cluster_id`）在同一事务内写回相关观察记录；以相同观察集合重复提交时沿用第一次结果，不会重复处理。
 
 ## 测试
 

@@ -6,28 +6,163 @@
   <title>野生动物疫病监测与离线同步</title>
   <style>
     body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; margin: 2rem; color: #1f2937; }
-    main { max-width: 820px; margin: auto; }
+    main { max-width: 880px; margin: auto; }
     pre { background: #f3f4f6; padding: 1rem; border-radius: 8px; overflow-x: auto; }
     button { padding: .5rem .8rem; cursor: pointer; }
+    table { border-collapse: collapse; width: 100%; margin: .5rem 0 1rem; }
+    th, td { border: 1px solid #d1d5db; padding: .35rem .5rem; text-align: left; font-size: .9rem; }
+    th { background: #f9fafb; }
+    .muted { color: #6b7280; }
   </style>
 </head>
 <body>
 <main>
   <h1>野生动物疫病监测与离线同步</h1>
-  <p>这是最小演示页面。使用浏览器或 curl 调用 JSON API。</p>
-  <p><button onclick="checkHealth()">检查服务状态</button></p>
+  <p>
+    用户：<input id="userId" value="duty-1" size="10">
+    角色：<select id="role">
+      <option value="epidemiologist" selected>epidemiologist</option>
+      <option value="admin">admin</option>
+      <option value="field">field</option>
+      <option value="lab">lab</option>
+      <option value="viewer">viewer</option>
+    </select>
+    <button onclick="checkHealth()">检查服务状态</button>
+    <button onclick="loadAll()">加载观察与事件</button>
+  </p>
+
+  <h2>聚集事件确认</h2>
+  <p class="muted">核实规则：同一区域、采样时间跨度不超过14天、两两相距不超过10公里，且至少三份已提交记录。已归入其他已确认事件或缺少坐标的记录会被拒绝并指出编号。</p>
+  <h3>已提交观察（勾选要合并的记录）</h3>
+  <div id="observations">尚未加载</div>
+  <h3>聚集事件（草稿可发起确认）</h3>
+  <div id="clusters">尚未加载</div>
+  <p><button onclick="confirmCluster()">对选中观察发起确认</button></p>
   <pre id="result">等待操作</pre>
+
+  <h2>关联情况</h2>
+  <div id="related">点击事件行的“查看关联”后显示</div>
+
   <h2>常用接口</h2>
   <pre>GET  /health
 GET  /api/&lt;kind&gt;
 POST /api/&lt;kind&gt;
 GET  /api/entities/&lt;id&gt;
-POST /api/entities/&lt;id&gt;/actions</pre>
+POST /api/entities/&lt;id&gt;/actions
+GET  /api/clusters/&lt;id&gt;/observations</pre>
 </main>
 <script>
+let observations = [];
+let clusters = [];
+
+function authHeaders() {
+  return {
+    'Content-Type': 'application/json',
+    'X-User-Id': document.getElementById('userId').value || 'anonymous',
+    'X-Role': document.getElementById('role').value,
+  };
+}
+
+function show(value) {
+  document.getElementById('result').textContent =
+    typeof value === 'string' ? value : JSON.stringify(value, null, 2);
+}
+
+function coordText(data) {
+  return (data.lat != null && data.lon != null) ? data.lat + ', ' + data.lon : '缺少坐标';
+}
+
 async function checkHealth() {
   const response = await fetch('/health');
-  document.getElementById('result').textContent = JSON.stringify(await response.json(), null, 2);
+  show(await response.json());
+}
+
+async function loadAll() {
+  const [obs, cls] = await Promise.all([
+    fetch('/api/observation').then(r => r.json()),
+    fetch('/api/cluster').then(r => r.json()),
+  ]);
+  observations = obs.items || [];
+  clusters = cls.items || [];
+  renderObservations();
+  renderClusters();
+  show({observations: observations.length, clusters: clusters.length});
+}
+
+function renderObservations() {
+  const submitted = observations.filter(o => o.status === 'submitted');
+  if (!submitted.length) {
+    document.getElementById('observations').textContent = '没有已提交的观察记录';
+    return;
+  }
+  let html = '<table><tr><th></th><th>编号</th><th>区域</th><th>采样时间</th><th>坐标</th><th>所属事件</th></tr>';
+  for (const o of submitted) {
+    const d = o.data || {};
+    html += '<tr><td><input type="checkbox" class="obs" value="' + o.id + '"></td>' +
+      '<td>' + o.id + '</td><td>' + (d.location || '') + '</td>' +
+      '<td>' + (d.observed_at || '') + '</td><td>' + coordText(d) + '</td>' +
+      '<td>' + (d.cluster_id || '') + '</td></tr>';
+  }
+  document.getElementById('observations').innerHTML = html + '</table>';
+}
+
+function renderClusters() {
+  if (!clusters.length) {
+    document.getElementById('clusters').textContent = '没有聚集事件';
+    return;
+  }
+  let html = '<table><tr><th></th><th>编号</th><th>区域</th><th>状态</th><th>观察数</th><th></th></tr>';
+  for (const c of clusters) {
+    const d = c.data || {};
+    const ids = d.observation_ids || [];
+    const radio = c.status === 'draft'
+      ? '<input type="radio" name="cluster" value="' + c.id + '">' : '';
+    html += '<tr><td>' + radio + '</td><td>' + c.id + '</td>' +
+      '<td>' + (d.region || '') + '</td><td>' + c.status + '</td>' +
+      '<td>' + ids.length + '</td>' +
+      '<td><button onclick="viewRelated(\'' + c.id + '\')">查看关联</button></td></tr>';
+  }
+  document.getElementById('clusters').innerHTML = html + '</table>';
+}
+
+async function confirmCluster() {
+  const chosen = document.querySelector('input[name="cluster"]:checked');
+  if (!chosen) { show('请先选择一个草稿状态的聚集事件'); return; }
+  const ids = Array.from(document.querySelectorAll('input.obs:checked')).map(el => el.value);
+  const withCoords = observations.filter(
+    o => ids.includes(o.id) && o.data && o.data.lat != null && o.data.lon != null
+  );
+  const centroid = withCoords.length
+    ? [withCoords.reduce((s, o) => s + o.data.lat, 0) / withCoords.length,
+       withCoords.reduce((s, o) => s + o.data.lon, 0) / withCoords.length]
+    : [0, 0];
+  const response = await fetch('/api/entities/' + chosen.value + '/actions', {
+    method: 'POST',
+    headers: authHeaders(),
+    body: JSON.stringify({
+      action: 'confirm_cluster',
+      data: {observation_ids: ids, centroid: centroid},
+    }),
+  });
+  show(await response.json());
+  loadAll();
+}
+
+async function viewRelated(clusterId) {
+  const response = await fetch('/api/clusters/' + clusterId + '/observations');
+  const related = await response.json();
+  if (!response.ok) { show(related); return; }
+  const c = related.cluster;
+  let html = '<p>事件 ' + c.id + '（区域 ' + ((c.data && c.data.region) || '') +
+    '，状态 ' + c.status + '）关联 ' + related.observations.length + ' 份观察：</p>';
+  html += '<table><tr><th>编号</th><th>区域</th><th>采样时间</th><th>坐标</th><th>状态</th></tr>';
+  for (const o of related.observations) {
+    const d = o.data || {};
+    html += '<tr><td>' + o.id + '</td><td>' + (d.location || '') + '</td>' +
+      '<td>' + (d.observed_at || '') + '</td><td>' + coordText(d) + '</td>' +
+      '<td>' + o.status + '</td></tr>';
+  }
+  document.getElementById('related').innerHTML = html + '</table>';
 }
 </script>
 </body>

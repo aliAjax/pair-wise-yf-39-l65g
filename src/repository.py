@@ -111,34 +111,46 @@ class SQLiteRepository:
         ]
 
     def update_entity(self, entity_id, expected_version, status, data):
+        return self.update_entities([
+            {
+                "id": entity_id,
+                "expected_version": expected_version,
+                "status": status,
+                "data": data,
+            }
+        ])[0]
+
+    def update_entities(self, updates):
         now = utcnow()
-        payload = json.dumps(data, ensure_ascii=False, sort_keys=True)
         connection = self._connect()
         try:
             connection.execute("BEGIN IMMEDIATE")
-            row = connection.execute(
-                "SELECT version FROM entities WHERE id = ?", (entity_id,)
-            ).fetchone()
-            if not row:
-                raise NotFoundError("entity not found: " + entity_id)
-            current_version = int(row["version"])
-            if expected_version is not None and current_version != int(expected_version):
-                raise ConflictError(
-                    "version conflict: expected %s, found %s"
-                    % (expected_version, current_version)
+            for update in updates:
+                row = connection.execute(
+                    "SELECT version FROM entities WHERE id = ?", (update["id"],)
+                ).fetchone()
+                if not row:
+                    raise NotFoundError("entity not found: " + update["id"])
+                current_version = int(row["version"])
+                expected = update.get("expected_version")
+                if expected is not None and current_version != int(expected):
+                    raise ConflictError(
+                        "version conflict: expected %s, found %s"
+                        % (expected, current_version)
+                    )
+                payload = json.dumps(update["data"], ensure_ascii=False, sort_keys=True)
+                connection.execute(
+                    "UPDATE entities SET status = ?, version = version + 1, data = ?, updated_at = ? "
+                    "WHERE id = ? AND version = ?",
+                    (update["status"], payload, now, update["id"], current_version),
                 )
-            connection.execute(
-                "UPDATE entities SET status = ?, version = version + 1, data = ?, updated_at = ? "
-                "WHERE id = ? AND version = ?",
-                (status, payload, now, entity_id, current_version),
-            )
             connection.commit()
         except Exception:
             connection.rollback()
             raise
         finally:
             connection.close()
-        return self.get_entity(entity_id)
+        return [self.get_entity(update["id"]) for update in updates]
 
     def append_audit(self, entity_id, actor_id, actor_role, action, from_status, to_status, detail):
         with self._connect() as connection:

@@ -1,4 +1,5 @@
 from datetime import datetime, timedelta
+from itertools import combinations
 
 from .domain import (
     ConflictError,
@@ -6,6 +7,10 @@ from .domain import (
     PermissionDenied,
     ValidationError,
 )
+
+CLUSTER_MIN_OBSERVATIONS = 3
+CLUSTER_MAX_DAYS = 14
+CLUSTER_RADIUS_KM = 10.0
 
 
 def _validate_observation(actor, data, lookup):
@@ -36,30 +41,121 @@ def _haversine_km(lat1, lon1, lat2, lon2):
     return 6371.0 * 2 * asin(sqrt(a))
 
 
-def is_cluster(observations, max_days=14, radius_km=10):
-    if len(observations) < 3:
+def is_cluster(observations, max_days=CLUSTER_MAX_DAYS, radius_km=CLUSTER_RADIUS_KM):
+    points = [
+        item
+        for item in observations
+        if item.get("lat") is not None
+        and item.get("lon") is not None
+        and item.get("observed_at")
+    ]
+    if len(points) < CLUSTER_MIN_OBSERVATIONS:
         return False
-    points = observations[:3]
-    same_window = all(
-        abs(_date_ordinal(points[0].get("observed_at")) - _date_ordinal(item.get("observed_at"))) <= max_days
-        for item in points[1:]
-    )
-    close = all(
-        _haversine_km(points[0]["lat"], points[0]["lon"], item["lat"], item["lon"]) <= radius_km
-        for item in points[1:]
-    )
-    return same_window and close
+    dates = [_date_ordinal(item["observed_at"]) for item in points]
+    if max(dates) - min(dates) > max_days:
+        return False
+    for first, second in combinations(points, 2):
+        if _haversine_km(first["lat"], first["lon"], second["lat"], second["lon"]) > radius_km:
+            return False
+    return True
+
+
+def _validate_confirm_cluster(actor, entity, data, lookup):
+    observation_ids = list(dict.fromkeys(data.get("observation_ids") or []))
+    problems = []
+    observations = []
+    for observation_id in observation_ids:
+        found = _find_one(lookup, "observation", "id", observation_id)
+        if found is None:
+            problems.append("observation not found: %s" % observation_id)
+        else:
+            observations.append(found)
+
+    submitted = [item for item in observations if item["status"] == "submitted"]
+    not_submitted = [item["id"] for item in observations if item["status"] != "submitted"]
+    if not_submitted:
+        problems.append("observations not submitted: %s" % ", ".join(not_submitted))
+    if len(submitted) < CLUSTER_MIN_OBSERVATIONS:
+        problems.append(
+            "at least %d submitted observations are required, got %d"
+            % (CLUSTER_MIN_OBSERVATIONS, len(submitted))
+        )
+
+    missing_coords = [
+        item["id"]
+        for item in observations
+        if item["data"].get("lat") is None or item["data"].get("lon") is None
+    ]
+    if missing_coords:
+        problems.append("observations missing coordinates: %s" % ", ".join(missing_coords))
+
+    region = entity["data"].get("region")
+    wrong_region = [
+        item["id"] for item in observations if item["data"].get("location") != region
+    ]
+    if wrong_region:
+        problems.append(
+            "observations outside region %s: %s" % (region, ", ".join(wrong_region))
+        )
+
+    for item in observations:
+        other = item["data"].get("cluster_id")
+        if not other or other == entity["id"]:
+            continue
+        other_cluster = _find_one(lookup, "cluster", "id", other)
+        if other_cluster and other_cluster["status"] == "confirmed":
+            problems.append(
+                "observation %s already belongs to confirmed cluster %s"
+                % (item["id"], other)
+            )
+
+    usable = [
+        item
+        for item in submitted
+        if item["data"].get("lat") is not None and item["data"].get("lon") is not None
+    ]
+    dates = []
+    for item in usable:
+        try:
+            dates.append(_date_ordinal(item["data"].get("observed_at")))
+        except (TypeError, ValueError):
+            problems.append("observation %s has invalid observed_at" % item["id"])
+    if dates and max(dates) - min(dates) > CLUSTER_MAX_DAYS:
+        problems.append(
+            "observations span more than %d days" % CLUSTER_MAX_DAYS
+        )
+    far_pairs = []
+    for first, second in combinations(usable, 2):
+        distance = _haversine_km(
+            first["data"]["lat"],
+            first["data"]["lon"],
+            second["data"]["lat"],
+            second["data"]["lon"],
+        )
+        if distance > CLUSTER_RADIUS_KM:
+            far_pairs.append(
+                "%s<->%s (%.1f km)" % (first["id"], second["id"], distance)
+            )
+    if far_pairs:
+        problems.append(
+            "observations more than %s km apart: %s"
+            % (CLUSTER_RADIUS_KM, ", ".join(far_pairs))
+        )
+
+    if problems:
+        raise ValidationError("; ".join(problems))
+    return {"observation_ids": observation_ids}
 
 
 CUSTOM_CREATE = {'observation': _validate_observation, 'sample': _validate_sample}
-CUSTOM_TRANSITIONS = {('sample', 'lab_result'): _validate_lab_result}
+CUSTOM_TRANSITIONS = {('sample', 'lab_result'): _validate_lab_result, ('cluster', 'confirm_cluster'): _validate_confirm_cluster}
 
 
 class RuleEngine:
     ALIASES = {'observations': 'observation', 'samples': 'sample', 'clusters': 'cluster'}
     INITIAL_STATUS = {'observation': 'captured', 'sample': 'collected', 'cluster': 'draft'}
     TRANSITIONS = {'observation': {'submit': (('captured',), 'submitted'), 'reject': (('submitted',), 'rejected'), 'link_sample': (('submitted',), 'sampled')}, 'sample': {'send_lab': (('collected',), 'in_lab'), 'lab_result': (('in_lab',), 'resulted'), 'retest': (('resulted',), 'in_lab'), 'close': (('resulted',), 'closed')}, 'cluster': {'confirm_cluster': (('draft',), 'confirmed'), 'dismiss': (('draft',), 'dismissed')}}
-    CREATE_REQUIRED = {'observation': ('event_id', 'species', 'location', 'observed_at', 'lat', 'lon'), 'sample': ('observation_id', 'sample_code'), 'cluster': ('region',)}
+    CREATE_REQUIRED = {'observation': ('event_id', 'species', 'location', 'observed_at'), 'sample': ('observation_id', 'sample_code'), 'cluster': ('region',)}
     ACTION_REQUIRED = {('observation', 'submit'): ('location', 'observed_at'), ('observation', 'reject'): ('reason',), ('observation', 'link_sample'): ('sample_id',), ('sample', 'send_lab'): ('lab_id',), ('sample', 'lab_result'): ('result', 'result_at'), ('sample', 'retest'): ('reason',), ('sample', 'close'): ('outcome',), ('cluster', 'confirm_cluster'): ('observation_ids', 'centroid'), ('cluster', 'dismiss'): ('reason',)}
     CREATE_ROLES = {'observation': ('admin', 'field'), 'sample': ('admin', 'field'), 'cluster': ('admin', 'epidemiologist')}
     ROLE_ACTIONS = {'submit': ('admin', 'field'), 'reject': ('admin', 'epidemiologist'), 'link_sample': ('admin', 'field'), 'send_lab': ('admin', 'field'), 'lab_result': ('admin', 'lab'), 'retest': ('admin', 'lab'), 'close': ('admin', 'epidemiologist'), 'confirm_cluster': ('admin', 'epidemiologist'), 'dismiss': ('admin', 'epidemiologist')}
